@@ -1,0 +1,5 @@
+bucket         = "cloudfordge-tfstate-<ACCOUNT_ID>"
+key            = "prod/terraform.tfstate"
+region         = "ap-south-1"
+dynamodb_table = "cloudfordge-tflock"
+encrypt        = true

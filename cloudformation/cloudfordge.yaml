@@ -1,0 +1,877 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFordge on AWS - VPC, RDS MySQL, EFS, ECR, CodeBuild, ALB, ECS Fargate, autoscaling and alarms
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: General }
+        Parameters: [ProjectName, Environment, VpcCidr]
+      - Label: { default: Application }
+        Parameters: [ImageTag, DesiredCount, MinTasks, MaxTasks, TaskCpu, TaskMemory, AppUrl, AdminEmail, DomainName, HostedZoneId, CertificateArn]
+      - Label: { default: Database }
+        Parameters: [DbInstanceClass, DbMultiAz]
+      - Label: { default: Build and alerts }
+        Parameters: [GitHubRepoUrl, GitHubBranch, ForceHttps, AlertEmail]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cloudfordge
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  Environment:
+    Type: String
+    Default: prod
+    AllowedPattern: '^[a-z][a-z0-9-]{1,10}$'
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    Description: Must be a /16. Six /20 subnets are carved out of it.
+  ImageTag:
+    Type: String
+    Default: v1
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Keep 0 on first deploy (no image exists yet). Set to 1 after the image is pushed and the migration task has run.
+  MinTasks:
+    Type: Number
+    Default: 1
+    MinValue: 1
+  MaxTasks:
+    Type: Number
+    Default: 3
+    MinValue: 1
+  TaskCpu:
+    Type: String
+    Default: '512'
+    AllowedValues: ['256', '512', '1024', '2048']
+  TaskMemory:
+    Type: String
+    Default: '1024'
+    Description: Must be a valid Fargate combination for the chosen CPU.
+  AppUrl:
+    Type: String
+    Default: ''
+    Description: Public URL for NEXTAUTH_URL and APP_URL. Empty uses the ALB DNS name over HTTP.
+  AdminEmail:
+    Type: String
+    Default: ''
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Public hostname (e.g. exam.example.com). When set, an ACM certificate (DNS validation) and a Route 53 alias to the ALB are created and HTTPS is enabled.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route 53 hosted zone ID that contains DomainName. Required when DomainName is set.
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Existing ACM certificate ARN, used only when DomainName is empty. Adds HTTPS 443 and redirects 80 to it.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbMultiAz:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  GitHubRepoUrl:
+    Type: String
+    Default: ''
+    Description: HTTPS URL of the GitHub repo. Empty skips the CodeBuild project.
+  GitHubBranch:
+    Type: String
+    Default: aws
+  ForceHttps:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Docker build arg FORCE_HTTPS (Next.js reads it at build time).
+  AlertEmail:
+    Type: String
+    Default: ''
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasCertificateArn: !Not [!Equals [!Ref CertificateArn, '']]
+  HasCertificate: !Or [!Condition HasDomain, !Condition HasCertificateArn]
+  HasAppUrl: !Not [!Equals [!Ref AppUrl, '']]
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasGitHubRepo: !Not [!Equals [!Ref GitHubRepoUrl, '']]
+  ServiceEnabled: !Not [!Equals [!Ref DesiredCount, 0]]
+  MultiAz: !Equals [!Ref DbMultiAz, 'true']
+
+Resources:
+  # ───────────── Network ─────────────
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-igw' }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-a' }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-b' }]
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-a' }]
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-b' }]
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-db-a' }]
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-db-b' }]
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-nat-eip' }]
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-nat' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-rt-public' }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  AppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-rt-app' }]
+  AppDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  AppAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref AppRouteTable }
+  AppAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref AppRouteTable }
+
+  # Database subnets get no default route: RDS needs no internet access.
+  DbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-rt-db' }]
+  DbAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetA, RouteTableId: !Ref DbRouteTable }
+  DbAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetB, RouteTableId: !Ref DbRouteTable }
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds: [!Ref AppRouteTable]
+
+  # ───────────── Security groups ─────────────
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-sg-alb'
+      GroupDescription: Public load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-sg-alb' }]
+
+  AlbHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCertificate
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-sg-app'
+      GroupDescription: ECS tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3005, ToPort: 3005, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-sg-app' }]
+
+  AlbToAppEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3005
+      ToPort: 3005
+      DestinationSecurityGroupId: !Ref AppSecurityGroup
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-sg-rds'
+      GroupDescription: RDS MySQL
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-sg-rds' }]
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-sg-efs'
+      GroupDescription: EFS mount targets
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref AppSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-sg-efs' }]
+
+  # ───────────── Secrets ─────────────
+  DbCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Generated RDS master credentials (feeds the RDS instance and DATABASE_URL)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"cloudfordge_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  AuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Generated NEXTAUTH_SECRET
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # Name matches the Console build: prod-cloudfordge-creds. Add SMTP_*, GOOGLE_*, ... keys by hand later.
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Environment}-${ProjectName}-creds'
+      SecretString: !Sub
+        - '{"DATABASE_URL":"mysql://cloudfordge_admin:{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}@${DbHost}:3306/cloudprep","NEXTAUTH_SECRET":"{{resolve:secretsmanager:${AuthSecretArn}:SecretString:secret}}"}'
+        - DbSecretArn: !Ref DbCredentials
+          AuthSecretArn: !Ref AuthSecret
+          DbHost: !GetAtt Database.Endpoint.Address
+
+  # ───────────── RDS ─────────────
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnets'
+      DBSubnetGroupDescription: CloudFordge database subnets
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+
+  # MySQL 8.0, not 8.4: the app does not pass allowPublicKeyRetrieval.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: cloudprep
+      MasterUsername: cloudfordge_admin
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbCredentials}:SecretString:password}}'
+      MultiAZ: !If [MultiAz, true, false]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+
+  # ───────────── ECR ─────────────
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-app'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep the last 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+
+  # ───────────── EFS ─────────────
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags: [{ Key: Name, Value: !Sub '${ProjectName}-uploads' }]
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref AppSubnetA
+      SecurityGroups: [!Ref EfsSecurityGroup]
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref AppSubnetB
+      SecurityGroups: [!Ref EfsSecurityGroup]
+  # The container runs as uid/gid 1001 (nextjs); the access point forces that identity.
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser: { Uid: '1001', Gid: '1001' }
+      RootDirectory:
+        Path: /uploads
+        CreationInfo: { OwnerUid: '1001', OwnerGid: '1001', Permissions: '755' }
+      AccessPointTags: [{ Key: Name, Value: !Sub '${ProjectName}-uploads-ap' }]
+
+  # ───────────── IAM ─────────────
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-read-secrets'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref AppSecret }
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: 'sts:AssumeRole' }
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-ecs-exec'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+        - PolicyName: !Sub '${ProjectName}-images-s3'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${ImagesBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ImagesBucket.Arn
+
+  # ───────────── S3 (question images, accessed through the task role) ─────────────
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-images-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ───────────── CodeBuild (image build) ─────────────
+  # A private repo needs a GitHub connection authorised once in the Console (CodeBuild, Settings).
+  # A new account may also have a concurrent-build quota of 0: request an increase in Service Quotas.
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasGitHubRepo
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-image-build'
+      RetentionInDays: 7
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: HasGitHubRepo
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: 'sts:AssumeRole' }
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-codebuild'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${CodeBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+
+  ImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: HasGitHubRepo
+    Properties:
+      Name: !Sub '${ProjectName}-image-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 30
+      SourceVersion: !Ref GitHubBranch
+      Source:
+        Type: GITHUB
+        Location: !Ref GitHubRepoUrl
+        GitCloneDepth: 1
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - docker build --build-arg FORCE_HTTPS=$FORCE_HTTPS --build-arg NEXT_PUBLIC_GA_ID="" -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${Repository}:$IMAGE_TAG .
+            post_build:
+              commands:
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${Repository}:$IMAGE_TAG
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: AWS_ACCOUNT_ID, Type: PLAINTEXT, Value: !Ref 'AWS::AccountId' }
+          - { Name: IMAGE_TAG, Type: PLAINTEXT, Value: !Ref ImageTag }
+          - { Name: FORCE_HTTPS, Type: PLAINTEXT, Value: !Ref ForceHttps }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+
+  # ───────────── Load balancer ─────────────
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg'
+      VpcId: !Ref Vpc
+      Port: 3005
+      Protocol: HTTP
+      ProtocolVersion: HTTP1
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/health
+      Matcher: { HttpCode: '200' }
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 30
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasDomain
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - { DomainName: !Ref DomainName, HostedZoneId: !Ref HostedZoneId }
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !If [HasDomain, !Ref Certificate, !Ref CertificateArn] }]
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  # ───────────── ECS ─────────────
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 7
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      ClusterSettings:
+        - { Name: containerInsights, Value: disabled }
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-app'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      Volumes:
+        - Name: uploads
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref AccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub '${Repository.RepositoryUri}:${ImageTag}'
+          Essential: true
+          PortMappings: [{ ContainerPort: 3005, Protocol: tcp }]
+          Environment:
+            - { Name: NODE_ENV, Value: production }
+            - { Name: PORT, Value: '3005' }
+            - { Name: HOSTNAME, Value: 0.0.0.0 }
+            - { Name: NEXTAUTH_URL, Value: !If [HasAppUrl, !Ref AppUrl, !If [HasDomain, !Sub 'https://${DomainName}', !Sub 'http://${LoadBalancer.DNSName}']] }
+            - { Name: APP_URL, Value: !If [HasAppUrl, !Ref AppUrl, !If [HasDomain, !Sub 'https://${DomainName}', !Sub 'http://${LoadBalancer.DNSName}']] }
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: '3306' }
+            - { Name: DB_NAME, Value: cloudprep }
+            - { Name: LOG_TO_FILE, Value: 'false' }
+            - !If
+              - HasAdminEmail
+              - { Name: ADMIN_EMAIL, Value: !Ref AdminEmail }
+              - !Ref AWS::NoValue
+          Secrets:
+            - { Name: DATABASE_URL, ValueFrom: !Sub '${AppSecret}:DATABASE_URL::' }
+            - { Name: NEXTAUTH_SECRET, ValueFrom: !Sub '${AppSecret}:NEXTAUTH_SECRET::' }
+          MountPoints:
+            - { SourceVolume: uploads, ContainerPath: /app/public/uploads, ReadOnly: false }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [MountTargetA, MountTargetB]
+    Properties:
+      ServiceName: !Sub '${ProjectName}-service'
+      # DependsOn cannot name a conditional resource. This tag makes the service wait for whichever
+      # listener forwards to the target group (HTTPS when a certificate is given, else HTTP).
+      Tags:
+        - Key: listener
+          Value: !If [HasCertificate, !Ref HttpsListener, !Ref HttpListener]
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 90
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref AppSubnetA, !Ref AppSubnetB]
+          SecurityGroups: [!Ref AppSecurityGroup]
+      LoadBalancers:
+        - { TargetGroupArn: !Ref TargetGroup, ContainerName: app, ContainerPort: 3005 }
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${Service.Name}'
+      MinCapacity: !If [ServiceEnabled, !Ref MinTasks, 0]
+      MaxCapacity: !Ref MaxTasks
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cpu-target'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  # ───────────── Alarms ─────────────
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      Subscription:
+        - !If
+          - HasAlertEmail
+          - { Protocol: email, Endpoint: !Ref AlertEmail }
+          - !Ref AWS::NoValue
+
+  AlbUnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-unhealthy-hosts'
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-target-5xx'
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+
+  EcsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ecs-cpu-high'
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      Dimensions:
+        - { Name: ClusterName, Value: !Ref Cluster }
+        - { Name: ServiceName, Value: !GetAtt Service.Name }
+
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-cpu-high'
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      Dimensions:
+        - { Name: DBInstanceIdentifier, Value: !Ref Database }
+
+  RdsFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-free-storage-low'
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3221225472
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      Dimensions:
+        - { Name: DBInstanceIdentifier, Value: !Ref Database }
+
+  RdsConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-connections-high'
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 40
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      Dimensions:
+        - { Name: DBInstanceIdentifier, Value: !Ref Database }
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  AppUrl:
+    Value: !If [HasAppUrl, !Ref AppUrl, !If [HasDomain, !Sub 'https://${DomainName}', !Sub 'http://${LoadBalancer.DNSName}']]
+  EcrRepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  RdsEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  SecretArn:
+    Value: !Ref AppSecret
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  CodeBuildProjectName:
+    Condition: HasGitHubRepo
+    Value: !Ref ImageBuildProject
+  ImagesBucketName:
+    Value: !Ref ImagesBucket
+  AppSubnets:
+    Value: !Sub '${AppSubnetA},${AppSubnetB}'
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup

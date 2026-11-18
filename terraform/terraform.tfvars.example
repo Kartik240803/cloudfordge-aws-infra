@@ -1,0 +1,18 @@
+region      = "ap-south-1"
+environment = "prod"
+
+# Bootstrap: keep 0 until the image is built and the migration has run, then set 1.
+desired_count = 0
+image_tag     = "v1"
+
+# CodeBuild (leave empty to skip creating the build project)
+github_repo_url = "https://github.com/<your-user>/<your-app-repo>"
+github_branch   = "aws"
+force_https     = "false"
+
+# Optional
+alert_email     = ""
+domain_name     = ""   # e.g. exam.example.com (creates ACM cert + Route 53 alias + HTTPS)
+hosted_zone_id  = ""   # Route 53 zone that contains domain_name
+certificate_arn = ""   # only if you bring your own cert and leave domain_name empty
+app_url         = ""

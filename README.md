@@ -107,7 +107,6 @@ See [docs/lessons-learned.md](docs/lessons-learned.md): a wrong database port, a
 
 ## Roadmap
 
-- Deploy and verify the HTTPS path with a real domain
 - Move question images from Cloudflare R2 to S3 through the task role
 - Move the in-memory rate limiter and cache to ElastiCache (Redis) for multi-task deployments
 - A CI/CD pipeline that builds on push and deploys a new task definition
